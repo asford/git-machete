@@ -1342,11 +1342,15 @@ def filtered_reflog(b, prefix):
               "skipping any reflog entry with the hash equal to the hash of the earliest (branch creation) entry: %s" % earliest_sha)
         shas_to_exclude.add(earliest_sha)
 
-    result = [sha for (sha, gs) in reflog(prefix + b) if sha not in shas_to_exclude and not is_excluded_reflog_subject(sha, gs)]
+    result = [sha for (sha, gs) in b_reflog if sha not in shas_to_exclude and not is_excluded_reflog_subject(sha, gs)]
     debug("filtered_reflog(%s, %s)" % (b, prefix),
           "computed filtered reflog (= reflog without branch creation "
           "and branch reset events irrelevant for fork point/upstream inference): %s\n" % (", ".join(result) or "<empty>"))
     return result
+
+
+def unfiltered_reflog(b, prefix):
+    return [sha for (sha, gs) in reflog(prefix + b)]
 
 
 def get_latest_checkout_timestamps():
@@ -1371,39 +1375,45 @@ def get_latest_checkout_timestamps():
     return result
 
 
-branch_defs_by_sha_in_reflog = None
+branch_defs_by_sha_in_reflog = {"filtered": None, "unfiltered": None}
 
 
-def match_log_to_filtered_reflogs(b):
+def match_log_to_filtered_reflogs(b, reflog_mode):
     global branch_defs_by_sha_in_reflog
 
     if b not in local_branches():
         raise MacheteException("`%s` is not a local branch" % b)
 
-    if branch_defs_by_sha_in_reflog is None:
+    if branch_defs_by_sha_in_reflog[reflog_mode] is None:
+
+        get_reflog = {
+            "filtered": filtered_reflog,
+            "unfiltered": unfiltered_reflog
+        }[reflog_mode]
+
         def generate_entries():
             for lb in local_branches():
                 lb_shas = set()
-                for sha_ in filtered_reflog(lb, prefix="refs/heads/"):
+                for sha_ in get_reflog(lb, prefix="refs/heads/"):
                     lb_shas.add(sha_)
                     yield sha_, (lb, lb)
                 rb = combined_counterpart_for_fetching_of_branch(lb)
                 if rb:
-                    for sha_ in filtered_reflog(rb, prefix="refs/remotes/"):
+                    for sha_ in get_reflog(rb, prefix="refs/remotes/"):
                         if sha_ not in lb_shas:
                             yield sha_, (lb, rb)
 
-        branch_defs_by_sha_in_reflog = {}
+        branch_defs_by_sha_in_reflog[reflog_mode] = {}
         for sha, branch_def in generate_entries():
-            if sha in branch_defs_by_sha_in_reflog:
+            if sha in branch_defs_by_sha_in_reflog[reflog_mode]:
                 # The practice shows that it's rather unlikely for a given commit to appear on filtered reflogs of two unrelated branches
                 # ("unrelated" as in, not a local branch and its remote counterpart) but we need to handle this case anyway.
-                branch_defs_by_sha_in_reflog[sha] += [branch_def]
+                branch_defs_by_sha_in_reflog[reflog_mode][sha] += [branch_def]
             else:
-                branch_defs_by_sha_in_reflog[sha] = [branch_def]
+                branch_defs_by_sha_in_reflog[reflog_mode][sha] = [branch_def]
 
         def log_result():
-            for sha_, branch_defs in branch_defs_by_sha_in_reflog.items():
+            for sha_, branch_defs in branch_defs_by_sha_in_reflog[reflog_mode].items():
                 yield dim("%s => %s" %
                           (sha_, ", ".join(map(tupled(lambda lb, lb_or_rb: lb if lb == lb_or_rb else "%s (remote counterpart of %s)" % (lb_or_rb, lb)), branch_defs))))
 
@@ -1411,15 +1421,15 @@ def match_log_to_filtered_reflogs(b):
 
     get_second = tupled(lambda lb, lb_or_rb: lb_or_rb)
     for sha in spoonfeed_log_shas(b):
-        if sha in branch_defs_by_sha_in_reflog:
+        if sha in branch_defs_by_sha_in_reflog[reflog_mode]:
             # The entries must be sorted by lb_or_rb to make sure the upstream inference is deterministic
             # (and does not depend on the order in which `generate_entries` iterated through the local branches).
-            containing_branch_defs = sorted(filter(tupled(lambda lb, lb_or_rb: lb != b), branch_defs_by_sha_in_reflog[sha]), key=get_second)
+            containing_branch_defs = sorted(filter(tupled(lambda lb, lb_or_rb: lb != b), branch_defs_by_sha_in_reflog[reflog_mode][sha]), key=get_second)
             if containing_branch_defs:
-                debug("match_log_to_filtered_reflogs(%s)" % b, "commit %s found in filtered reflog of %s" % (sha, " and ".join(map(get_second, branch_defs_by_sha_in_reflog[sha]))))
+                debug("match_log_to_filtered_reflogs(%s)" % b, "commit %s found in filtered reflog of %s" % (sha, " and ".join(map(get_second, branch_defs_by_sha_in_reflog[reflog_mode][sha]))))
                 yield sha, containing_branch_defs
             else:
-                debug("match_log_to_filtered_reflogs(%s)" % b, "commit %s found only in filtered reflog of %s; ignoring" % (sha, " and ".join(map(get_second, branch_defs_by_sha_in_reflog[sha]))))
+                debug("match_log_to_filtered_reflogs(%s)" % b, "commit %s found only in filtered reflog of %s; ignoring" % (sha, " and ".join(map(get_second, branch_defs_by_sha_in_reflog[reflog_mode][sha]))))
         else:
             debug("match_log_to_filtered_reflogs(%s)" % b, "commit %s not found in any filtered reflog" % sha)
 
@@ -1448,7 +1458,7 @@ def is_merged_to_upstream(b):
 
 
 def infer_upstream(b, condition=lambda u: True, reject_reason_message=""):
-    for sha, containing_branch_defs in match_log_to_filtered_reflogs(b):
+    for sha, containing_branch_defs in match_log_to_filtered_reflogs(b, "unfiltered"):
         debug("infer_upstream(%s)" % b, "commit %s found in filtered reflog of %s" % (sha, " and ".join(map(tupled(lambda x, y: y), containing_branch_defs))))
 
         for candidate, original_matched_branch in containing_branch_defs:
@@ -1597,7 +1607,7 @@ def fork_point_and_containing_branch_defs(b, use_overrides):
                 return overridden_fp_sha, []
 
     try:
-        fp_sha, containing_branch_defs = next(match_log_to_filtered_reflogs(b))
+        fp_sha, containing_branch_defs = next(match_log_to_filtered_reflogs(b, "filtered"))
     except StopIteration:
         if u and is_ancestor(u, b):
             debug("fork_point_and_containing_branch_defs(%s)" % b,
@@ -1883,7 +1893,7 @@ class StopTraversal(Exception):
 def flush_caches():
     global branch_defs_by_sha_in_reflog, commit_sha_by_revision_cached, config_cached, counterparts_for_fetching_cached, initial_log_shas_cached
     global local_branches_cached, reflogs_cached, remaining_log_shas_cached, remote_branches_cached
-    branch_defs_by_sha_in_reflog = None
+    branch_defs_by_sha_in_reflog = {"filtered": None, "unfiltered": None}
     commit_sha_by_revision_cached = None
     config_cached = None
     counterparts_for_fetching_cached = None
