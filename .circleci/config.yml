@@ -26,10 +26,16 @@ jobs:
             sudo mv yq_linux_amd64 /usr/local/bin/yq
             sudo chmod +x /usr/local/bin/yq
 
-      - run: PYTHON_VERSION=3.6 GIT_VERSION=1.7.10 bash ci/tox/ci-run.sh  # Earliest versions of python/git supported by git-machete
-      - run: PYTHON_VERSION=3.7 GIT_VERSION=2.7.6  bash ci/tox/ci-run.sh
-      - run: PYTHON_VERSION=3.8 GIT_VERSION=2.25.0 bash ci/tox/ci-run.sh
-      - run: PYTHON_VERSION=3.9 GIT_VERSION=2.30.1 bash ci/tox/ci-run.sh
+      - deploy:
+          name: '[Dry run] Open PR to NixOS/nixpkgs'
+          # Prerequisites: artifacts must be released to test PyPI first
+          # Side effects: potentially pushes a regenerated Docker image
+          command: bash ci/nixpkgs-pr/ci-deploy.sh --dry-run
+
+#      - run: PYTHON_VERSION=3.6 GIT_VERSION=1.7.10 bash ci/tox/ci-run.sh  # Earliest versions of python/git supported by git-machete
+#      - run: PYTHON_VERSION=3.7 GIT_VERSION=2.7.6  bash ci/tox/ci-run.sh
+#      - run: PYTHON_VERSION=3.8 GIT_VERSION=2.25.0 bash ci/tox/ci-run.sh
+#      - run: PYTHON_VERSION=3.9 GIT_VERSION=2.30.1 bash ci/tox/ci-run.sh
 
       - when:
           condition:
