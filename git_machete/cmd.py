@@ -329,12 +329,13 @@ def popen_git(cli_ctxt: CommandLineContext, git_cmd: str, *args: str, **kwargs: 
 
 
 class MacheteContext:
-    managed_branches: List[str] = []
-    down_branches: Dict[str, List[str]] = {}  # TODO (#110): default dict with []
-    up_branch: Dict[str, str] = {}  # TODO (#110): default dict with None
-    indent: Optional[str] = None
-    roots: List[str] = []
-    annotations: Dict[str, str] = {}
+    def __init__(self) -> None:
+        self.managed_branches: List[str] = []
+        self.down_branches: Dict[str, List[str]] = {}  # TODO (#110): default dict with []
+        self.up_branch: Dict[str, str] = {}  # TODO (#110): default dict with None
+        self.indent: Optional[str] = None
+        self.roots: List[str] = []
+        self.annotations: Dict[str, str] = {}
 
 
 def expect_in_managed_branches(machete_ctxt: MacheteContext, b: str) -> None:
