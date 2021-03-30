@@ -124,6 +124,7 @@ class CommandLineContext:
         self.opt_checked_out_since: Optional[str] = None
         self.opt_color: str = "auto"
         self.opt_debug: bool = False
+        self.opt_draft: bool = False
         self.opt_down_fork_point: Optional[str] = None
         self.opt_fetch: bool = False
         self.opt_fork_point: Optional[str] = None
@@ -647,31 +648,128 @@ def annotate(b: str, words: List[str]) -> None:
     save_definition_file()
 
 
-def sync_annotations_to_github_prs(cli_ctxt: CommandLineContext) -> None:
-    global annotations, managed_branches
-    from git_machete.github import derive_current_user_login, derive_pull_requests, GitHubPullRequest, parse_github_remote_url
+def print_annotation(b: str) -> None:
+    global annotations
+    if b in annotations:
+        print(annotations[b])
 
-    url_for_remote: Dict[str, str] = {r: get_url_of_remote(cli_ctxt, r) for r in remotes(cli_ctxt)}
+
+# GitHub support
+
+def derive_remote_and_github_org_and_repo(cli_ctxt: CommandLineContext) -> Tuple[str, Tuple[str, str]]:
+    from git_machete.github import is_github_remote_url, parse_github_remote_url
+
+    url_for_remote: Dict[str, str] = {
+        remote: get_url_of_remote(cli_ctxt, remote) for remote in remotes(cli_ctxt)
+    }
     if not url_for_remote:
         raise MacheteException(fmt('No remotes defined for this repository (see `git remote`)'))
 
-    optional_org_name_for_github_remote: Dict[str, Optional[Tuple[str, str]]] = {remote: parse_github_remote_url(url) for remote, url in url_for_remote.items()}
-    org_name_for_github_remote: Dict[str, Tuple[str, str]] = {remote: org_name for remote, org_name in optional_org_name_for_github_remote.items() if org_name}
-    if not org_name_for_github_remote:
+    org_and_repo_for_github_remote: Dict[str, Tuple[str, str]] = {
+        remote: parse_github_remote_url(url) for remote, url in url_for_remote.items() if is_github_remote_url(url)
+    }
+    if not org_and_repo_for_github_remote:
         raise MacheteException(fmt('Remotes are defined for this repository, but none of them corresponds to GitHub (see `git remote -v` for details)'))
+
+    if len(org_and_repo_for_github_remote) == 1:
+        return list(org_and_repo_for_github_remote.items())[0]
+
+    if 'origin' in org_and_repo_for_github_remote:
+        return 'origin', org_and_repo_for_github_remote['origin']
+
+    raise MacheteException(f'Multiple non-origin remotes correspond to GitHub in this repository: '
+                           f'{", ".join(org_and_repo_for_github_remote.keys())}, aborting')
+
+
+def create_github_pr(cli_ctxt: CommandLineContext, head: str, draft: bool) -> None:
+    global annotations, up_branch
+    from git_machete.github import GitHubPullRequest, add_assignees_to_pull_request, add_reviewers_to_pull_request, \
+        create_pull_request, derive_current_user_login, set_milestone_of_pull_request
+
+    base: Optional[str] = up_branch.get(head)
+    if not base:
+        raise MacheteException(f'Branch {head} does not have a parent branch (it is a root), base branch for the PR cannot be established')
 
     org: str
     repo: str
-    if len(org_name_for_github_remote) == 1:
-        org, repo = list(org_name_for_github_remote.values())[0]
-    elif len(org_name_for_github_remote) > 1:
-        if 'origin' in org_name_for_github_remote:
-            org, repo = org_name_for_github_remote['origin']
-        else:
-            raise MacheteException(f'Multiple non-origin remotes correspond to GitHub in this repository: '
-                                   f'{", ".join(org_name_for_github_remote.keys())}, aborting')
+    _, (org, repo) = derive_remote_and_github_org_and_repo(cli_ctxt)
     current_user: Optional[str] = derive_current_user_login()
-    debug(cli_ctxt, 'sync_annotations_to_github_prs()', 'Current GitHub user is ' + (current_user or '<none>'))
+    debug(cli_ctxt, f'create_github_pr({head})', f'organization is {org}, repository is {repo}')
+    debug(cli_ctxt, f'create_github_pr({head})', 'current GitHub user is ' + (current_user or '<none>'))
+
+    def slurp_file_or_empty(path: str) -> str:
+        try:
+            return open(path).read()
+        except IOError:
+            return ''
+
+    title: str = popen_git(cli_ctxt, "log", "-1", "--format=%s").strip()
+    description_path = get_git_subpath(cli_ctxt, 'info', 'description')
+    description: str = slurp_file_or_empty(description_path)
+
+    pr: GitHubPullRequest = create_pull_request(org, repo, head=head, base=base, title=title, description=description, draft=draft)
+    debug(cli_ctxt, f'create_github_pr({head})', f'created {pr}')
+
+    milestone_path: str = get_git_subpath(cli_ctxt, 'info', 'milestone')
+    milestone: str = slurp_file_or_empty(milestone_path).strip()
+    if milestone:
+        debug(cli_ctxt, f'create_github_pr({head})', f'setting milestone of PR #{pr.number} to {milestone}')
+        set_milestone_of_pull_request(org, repo, pr.number, milestone=milestone)
+
+    if current_user:
+        debug(cli_ctxt, f'create_github_pr({head})', f'adding {current_user} as assignee to PR #{pr.number}')
+        add_assignees_to_pull_request(org, repo, pr.number, [current_user])
+
+    reviewers_path = get_git_subpath(cli_ctxt, 'info', 'reviewers')
+    reviewers: List[str] = non_empty_lines(slurp_file_or_empty(reviewers_path))
+    if reviewers:
+        debug(cli_ctxt, f'create_github_pr({head})', f'adding {", ".join(reviewers)} as reviewers to PR #{pr.number}')
+        add_reviewers_to_pull_request(org, repo, pr.number, reviewers)
+
+    annotations[head] = f'PR #{pr.number}'
+    save_definition_file()
+
+    print(fmt(f'Created {pr}, see <b>{pr.html_url}</b>'))
+
+
+def retarget_github_pr(cli_ctxt: CommandLineContext, head: str) -> None:
+    global up_branch
+    from git_machete.github import GitHubPullRequest, derive_pull_request_by_head, set_base_of_pull_request
+
+    org: str
+    repo: str
+    _, (org, repo) = derive_remote_and_github_org_and_repo(cli_ctxt)
+
+    debug(cli_ctxt, f'retarget_github_pr({head})', f'organization is {org}, repository is {repo}')
+
+    pr: Optional[GitHubPullRequest] = derive_pull_request_by_head(org, repo, head)
+    if not pr:
+        raise MacheteException(f'No PR is opened in `{org}/{repo}` for branch `{head}`')
+    debug(cli_ctxt, f'retarget_github_pr({head})', f'found {pr}')
+
+    new_base: Optional[str] = up_branch.get(head)
+    if not new_base:
+        raise MacheteException(f'Branch `{head}` does not have a parent branch (it is a root) '
+                               f'even though there is an open PR #{pr.number} to `{pr.base}`.\n'
+                               f'Consider modifying the branch definition file (`git machete edit`) so that `{head}` is a child of `{pr.base}`.')
+
+    if pr.base != new_base:
+        set_base_of_pull_request(org, repo, pr.number, base=new_base)
+    else:
+        print(fmt(f'The base branch of PR #{pr.number} is already `{new_base}`'))
+
+
+def sync_annotations_to_github_prs(cli_ctxt: CommandLineContext) -> None:
+    global annotations, managed_branches
+    from git_machete.github import derive_current_user_login, derive_pull_requests, GitHubPullRequest
+
+    org: str
+    repo: str
+    _, (org, repo) = derive_remote_and_github_org_and_repo(cli_ctxt)
+    current_user: Optional[str] = derive_current_user_login()
+    debug(cli_ctxt, 'sync_annotations_to_github_prs()', f'organization is {org}, repository is {repo}')
+    debug(cli_ctxt, 'sync_annotations_to_github_prs()', 'current GitHub user is ' + (current_user or '<none>'))
+
     pr: GitHubPullRequest
     for pr in derive_pull_requests(org, repo):
         if pr.head in managed_branches:
@@ -683,19 +781,13 @@ def sync_annotations_to_github_prs(cli_ctxt: CommandLineContext) -> None:
             if pr.base != u:
                 warn(f'branch `{pr.head}` has a different base in PR #{pr.number} (`{pr.base}`) '
                      f'than in machete file (`{u or "<none, is a root>"}`)')
-                anno += f" WRONG BASE? PR has '{pr.base}'"
+                anno += f" WRONG PR BASE or MACHETE PARENT? PR has '{pr.base}'"
             if annotations.get(pr.head) != anno:
                 print(fmt(f'Annotating <b>{pr.head}</b> as `{anno}`'))
                 annotations[pr.head] = anno
         else:
             debug(cli_ctxt, 'sync_annotations_to_github_prs()', f'{pr} does NOT correspond to a managed branch')
     save_definition_file()
-
-
-def print_annotation(b: str) -> None:
-    global annotations
-    if b in annotations:
-        print(annotations[b])
 
 
 # Implementation of basic git or git-related commands
@@ -2609,6 +2701,24 @@ def status(cli_ctxt: CommandLineContext, warn_on_yellow_edges: bool) -> None:
 
 
 def usage(c: str = None) -> None:
+    aliases = {
+        "diff": "d",
+        "edit": "e",
+        "go": "g",
+        "log": "l",
+        "status": "s"
+    }
+    inv_aliases = {v: k for k, v in aliases.items()}
+
+    groups = [
+        # 'is-managed' is mostly for scripting use and therefore skipped
+        ("General topics", ["file", "help", "hooks", "version"]),
+        ("Build, display and modify the tree of branch dependencies", ["add", "anno", "discover", "edit", "hub", "status"]),
+        ("List, check out and delete branches", ["delete-unmanaged", "go", "list", "show"]),
+        ("Determine changes specific to the given branch", ["diff", "fork-point", "log"]),
+        ("Update git history in accordance with the tree of branch dependencies", ["advance", "reapply", "slide-out", "squash", "traverse", "update"])
+    ]
+
     short_docs = {
         "add": "Add a branch to the tree of branch dependencies",
         "advance": "Fast-forward merge one of children to the current branch and then slide out this child",
@@ -2623,7 +2733,8 @@ def usage(c: str = None) -> None:
         "go": "Check out the branch relative to the position of the current branch, accepts down/first/last/next/root/prev/up argument",
         "help": "Display this overview, or detailed help for a specified command",
         "hooks": "Display docs for the extra hooks added by git machete",
-        "is-managed": "Check if the current branch is managed by git-machete (mostly for scripts)",
+        "hub": "Create, checkout and manage GitHub PRs while keeping them reflected in git machete",
+        "is-managed": "Check if the current branch is managed by git machete (mostly for scripts)",
         "list": "List all branches that fall into one of pre-defined categories (mostly for internal use)",
         "log": "Log the part of history specific to the given branch",
         "reapply": "Rebase the current branch onto its computed fork point",
@@ -2967,6 +3078,38 @@ def usage(c: str = None) -> None:
             Please see hook_samples/ directory of git-machete project for examples.
             An example of using the standard git `post-commit` hook to `git machete add` branches automatically is also included.
         """,
+        "hub": """
+            <b>Usage: git machete hub <subcommand></b>
+            where <subcommand> is one of: `anno-prs`, `create-pr`, `retarget-pr`.
+
+            Creates, checks out and manages GitHub PRs while keeping them reflected in branch definition file.
+
+            For all subcommands, to allow GitHub API access for private repositories
+            (and also to correctly identify the current user, even in case of public repositories),
+            `GITHUB_TOKEN` env var must contain a GitHub API token with `repo` scope, see `https://github.com/settings/tokens`.
+
+            <b>`anno-prs`:</b>
+
+              Annotates the branches based on their corresponding GitHub PR numbers and authors.
+              Any existing annotations are overwritten for the branches that have an opened PR; annotations for the other branches remain untouched.
+              Equivalent to `git machete anno --sync-github-prs`.
+
+            <b>`create-pr [--draft]`:</b>
+
+              Creates a PR for the current branch, using the upstream (parent) branch as the PR base.
+              Once the PR is successfully created, annotates the current branch with the new PR's number.
+
+              If `.git/info/description` file is present, its contents is used as PR description.
+              If `.git/info/milestone` file is present, its contents (a single number - milestone id) is used as milestone.
+              If `.git/info/reviewers` file is present, its contents (one GitHub login per line) are used to set reviewers.
+
+              <b>Options:</b>
+                <b>--draft</b>    Creates the new PR as a draft.
+
+            <b>`retarget-pr`:</b>
+
+              Sets the base of the current branch's PR to upstream (parent) branch, as seen by git machete (see `git machete show up`).
+        """,
         "is-managed": """
             <b>Usage: git machete is-managed [<branch>]</b>
 
@@ -2979,7 +3122,7 @@ def usage(c: str = None) -> None:
         """,
         "list": """
             <b>Usage: git machete list <category></b>
-            where <category> is one of: `addable`, `managed`, `slidable`, `slidable-after <branch>`, `unmanaged`, `with-overridden-fork-point`
+            where <category> is one of: `addable`, `managed`, `slidable`, `slidable-after <branch>`, `unmanaged`, `with-overridden-fork-point`.
 
             Lists all branches that fall into one of the specified categories:
             * `addable`: all branches (local or remote) than can be added to the definition file,
@@ -3230,23 +3373,7 @@ def usage(c: str = None) -> None:
             Prints the version and exits.
         """
     }
-    aliases = {
-        "diff": "d",
-        "edit": "e",
-        "go": "g",
-        "log": "l",
-        "status": "s"
-    }
-    inv_aliases = {v: k for k, v in aliases.items()}
 
-    groups = [
-        # 'is-managed' is mostly for scripting use and therefore skipped
-        ("General topics", ["file", "help", "hooks", "version"]),
-        ("Build, display and modify the tree of branch dependencies", ["add", "anno", "discover", "edit", "status"]),
-        ("List, check out and delete branches", ["delete-unmanaged", "go", "list", "show"]),
-        ("Determine changes specific to the given branch", ["diff", "fork-point", "log"]),
-        ("Update git history in accordance with the tree of branch dependencies", ["advance", "reapply", "slide-out", "squash", "traverse", "update"])
-    ]
     if c and c in inv_aliases:
         c = inv_aliases[c]
     if c and c in long_docs:
@@ -3315,6 +3442,8 @@ def launch(orig_args: List[str]) -> None:
                 cli_ctxt.opt_down_fork_point = arg
             elif opt == "--debug":
                 cli_ctxt.opt_debug = True
+            elif opt == "--draft":
+                cli_ctxt.opt_draft = True
             elif opt in ("-F", "--fetch"):
                 cli_ctxt.opt_fetch = True
             elif opt in ("-f", "--fork-point"):
@@ -3415,11 +3544,11 @@ def launch(orig_args: List[str]) -> None:
         else:
             return in_args[0]
 
-    def check_required_param(in_args: List[str], allowed_values: str) -> str:
+    def check_required_param(in_args: List[str], allowed_values_string: str) -> str:
         if not in_args or len(in_args) > 1:
-            raise MacheteException(f"`{cmd}` expects exactly one argument: one of {allowed_values}")
+            raise MacheteException(f"`{cmd}` expects exactly one argument: one of {allowed_values_string}")
         elif not in_args[0]:
-            raise MacheteException(f"Argument to `{cmd}` cannot be empty; expected one of {allowed_values}")
+            raise MacheteException(f"Argument to `{cmd}` cannot be empty; expected one of {allowed_values_string}")
         elif in_args[0][0] == "-":
             raise MacheteException(f"Option `{in_args[0]}` not recognized")
         else:
@@ -3553,6 +3682,22 @@ def launch(orig_args: List[str]) -> None:
             param = check_optional_param(parse_options(args))
             # No need to read definition file.
             usage(param)
+        elif cmd == "hub":
+            hub_allowed_values = "anno-prs|create-pr|retarget-pr"
+            param = check_required_param(parse_options(args, "", ["draft"]), hub_allowed_values)
+            read_definition_file(cli_ctxt)
+            if param == "anno-prs":
+                sync_annotations_to_github_prs(cli_ctxt)
+            elif param == "create-pr":
+                cb = current_branch(cli_ctxt)
+                expect_in_managed_branches(cb)
+                create_github_pr(cli_ctxt, cb, draft=cli_ctxt.opt_draft)
+            elif param == "retarget-pr":
+                cb = current_branch(cli_ctxt)
+                expect_in_managed_branches(cb)
+                retarget_github_pr(cli_ctxt, cb)
+            else:
+                raise MacheteException(f"`hub` requires a subcommand: one of `{hub_allowed_values}`")
         elif cmd == "is-managed":
             param = check_optional_param(parse_options(args))
             read_definition_file(cli_ctxt)
