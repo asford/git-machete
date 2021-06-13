@@ -275,8 +275,17 @@ def popen_cmd(cli_ctxt: CommandLineContext, cmd: str, *args: str, **kwargs: Any)
     elif cli_ctxt.opt_verbose:
         sys.stderr.write(flat_cmd + "\n")
 
+    input_bytes: Optional[bytes]
+    if "input" in kwargs:
+        kwargs["stdin"] = subprocess.PIPE
+        input = kwargs.pop("input")
+        assert isinstance(input, str)
+        input_bytes = input.encode()
+    else:
+        input_bytes = None
+
     process = subprocess.Popen([cmd] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
-    stdout_bytes, stderr_bytes = process.communicate()
+    stdout_bytes, stderr_bytes = process.communicate(input_bytes)
     stdout: str = stdout_bytes.decode('utf-8')
     stderr: str = stderr_bytes.decode('utf-8')
     exit_code: int = process.returncode
@@ -288,6 +297,35 @@ def popen_cmd(cli_ctxt: CommandLineContext, cmd: str, *args: str, **kwargs: Any)
             sys.stderr.write(f"{dim('<stdout>:')}\n{dim(stdout)}\n")
         if stderr:
             sys.stderr.write(f"{dim('<stderr>:')}\n{colored(stderr, RED)}\n")
+
+    return exit_code, stdout, stderr
+
+
+def popen_cmd_bytes(cli_ctxt: CommandLineContext, cmd: str, *args: str, input: bytes = None, **kwargs: Any) -> Tuple[int, bytes, bytes]:
+    chdir_upwards_until_current_directory_exists(cli_ctxt)
+
+    flat_cmd = cmd_shell_repr(cmd, *args, **kwargs)
+    if cli_ctxt.opt_debug:
+        sys.stderr.write(bold(f">>> {flat_cmd}") + "\n")
+    elif cli_ctxt.opt_verbose:
+        sys.stderr.write(flat_cmd + "\n")
+
+    if input is not None:
+        kwargs["stdin"] = subprocess.PIPE
+
+    process = subprocess.Popen([cmd] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+    stdout: bytes
+    stderr: bytes
+    stdout, stderr = process.communicate(input)
+    exit_code: int = process.returncode
+
+    if cli_ctxt.opt_debug:
+        if exit_code != 0:
+            sys.stderr.write(colored(f"<exit code: {exit_code}>\n\n", RED))
+        if stdout:
+            sys.stderr.write(f"{dim('<stdout>:')}\n{dim(stdout.decode())}\n")
+        if stderr:
+            sys.stderr.write(f"{dim('<stderr>:')}\n{colored(stderr.decode(), RED)}\n")
 
     return exit_code, stdout, stderr
 
@@ -1117,9 +1155,104 @@ def is_ancestor(
     return merge_base(cli_ctxt, earlier_sha, later_sha) == earlier_sha
 
 
-# Determine if later_revision, or any ancestors of later_revision, contain a
-# tree with identical contents to earlier_revision, indicating that
-# later_revision contains a rebase or squash merge of earlier_revision.
+# Given a list of commit shas, read tree ids via cat-file.
+# Yields (commit_sha, tree_sha) tuples for all commits successfully resolved to a tree object.
+def _get_commit_tree_ids(
+    cli_ctxt: CommandLineContext,
+    commit_shas: Iterable[str],
+) -> Iterable[Tuple[str, str]]:
+
+    # cat-file --batch print object blobs in a record-oriented streaming format
+    # See:
+    # https://git-scm.com/docs/git-cat-file#_batch_output
+    #
+    # Down in the plumbing, so stay in raw bytes
+    _exit, cat_result, _cat_error = popen_cmd_bytes(
+        cli_ctxt,
+        "git",
+        "cat-file",
+        "--batch",
+        input="\n".join(commit_shas).encode()
+    )
+
+    reader = io.BytesIO(cat_result)
+
+    # Stream through the cat-file results, yielding (commit_sha, tree_sha)
+    # when a valid commit object in found.
+    #
+    # In the happy path cat-file should emit for every sha,
+    # however there may be missing objects/symlinks/etc is more esoteric
+    # repository states.
+    # Just ignore these records.
+    object_line = reader.readline().strip()
+    while object_line:
+        # We want objects of the form
+        # '<hash> commit <content_size>\n<content>\n'
+        object_info = object_line.split()
+
+        # But there are alternative forms if the commit is missing, lives in a symlink, etc.
+        #
+        # However, if the read has any content the last entry will be an integer content size.
+        # First read any content that's present off the input stream.
+        #
+        # object_info may be a three tuple or two tuple. Eg:
+        # <object> <type> <size>\n<content>\m
+        # symlink <size>\n<content>\n
+        #
+        # If the read has no content it will be a two-tuple. Eg:
+        # <object> missing\n
+        # <object> ambiguous\n
+        #
+        # Just try to parse for the size...
+        size = None
+        content = None
+        try:
+            size = int(object_info[-1])
+        except ValueError:
+            pass
+
+        if size is not None:
+            # Trailing newline on content
+            content = reader.read(size + 1)
+            assert content[-1:] == b"\n"
+            content = content[:-1]
+
+        # Now we've read through the object in the content stream and
+        # can safely continue if we don't find an object of interest
+        if object_info[1] != b"commit":
+            debug(
+                cli_ctxt,
+                "non-commit object via cat-file",
+                f"object_info = {object_info}"
+            )
+            continue
+
+        # commit objects are line-oriented records themselves,
+        # but always start with the tree reference of the form:
+        #
+        # tree <tree_sha>\n
+        #
+        # https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
+        if not content.startswith(b"tree"):
+            debug(
+                cli_ctxt,
+                "commit object didn't start with tree entry",
+                f"object_info = {object_info}"
+            )
+            continue
+
+        _tree, tree_sha, _rest = content.split(maxsplit=2)
+
+        yield (object_info[0].decode(), tree_sha.decode())
+
+        # Read the next object record
+        object_line = reader.readline().strip()
+
+
+# Determine if later_revision, or any ancestors of later_revision that aren't
+# ancestors of earlier_revision, contain a tree with identical contents to
+# earlier_revision, indicating that later_revision contains a rebase or squash
+# merge of earlier_revision.
 def contains_equivalent_tree(
     cli_ctxt: CommandLineContext,
     earlier_revision: str,
@@ -1152,27 +1285,17 @@ def contains_equivalent_tree(
         )
     )
 
+    # Resolve the earlier sha tree id from git
+    (_earlier_sha, earlier_tree), = _get_commit_tree_ids(cli_ctxt, [earlier_sha])
+
     # Check later_sha and all the itermediate ancestors of later_sha to
     # determine if they've an equivalent tree to earlier_sha
-    for intermediate_sha in intermediate_shas:
-        # git diff-tree --quiet
-        # Exits with 1 if there were differences and 0 means no differences.
-        #
-        # https://git-scm.com/docs/git-diff-tree#Documentation/git-diff-tree.txt---quiet
-        diff_result = run_cmd(
-            cli_ctxt,
-            "git",
-            "diff-tree",
-            "--quiet",
-            earlier_sha,
-            intermediate_sha
-        )
-
-        if diff_result == 0:
+    for _sha, tree in _get_commit_tree_ids(cli_ctxt, intermediate_shas):
+        if tree == earlier_tree:
             debug(
                 cli_ctxt,
                 "contains_equivalent_tree found",
-                f"earlier_sha={earlier_sha} intermediate_sha={intermediate_sha}"
+                f"earlier_sha={earlier_sha} intermediate_sha={_sha} tree={tree}"
             )
             return True
 
